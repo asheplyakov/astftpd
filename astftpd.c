@@ -9,6 +9,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -76,10 +78,6 @@ enum {
 	BLKSIZE_DFLT = 512,
 };
 
-enum {
-	MAX_BLOCK_STUB = 8,
-};
-
 enum tftp_client_state {
 	S_RRQ_RECIEVED   = 1,
 	S_SEND_DATA      = 2,
@@ -88,9 +86,26 @@ enum tftp_client_state {
 	S_TIMEOUT        = 5,
 };
 
+/* stores the whole file cached in the RAM */
+struct tftpd_file {
+	char *filename;
+	char *cache;
+	size_t size;
+	int fd;
+	int refcnt;
+	struct tftpd_file *next;
+};
+
+ssize_t cache_tftpd_file(struct tftpd_file *tf);
+void close_tftpd_file(struct tftpd_file *tf);
+int populate_file_cache(struct tftpd_file *head);
+struct tftpd_file *find_tftpd_file(struct tftpd_file *head, const char *filename);
+struct tftpd_file *add_tftpd_file(struct tftpd_file **headp, const char *filename);
+
 struct tftpd_client {
 	int sock;
 	int fd;
+	struct tftpd_file *file; // owned by tftpd_ctx
 	uint16_t block_num;
 	uint16_t block_size;
 	uint16_t tftp_tid; // local port number, in network byte order
@@ -126,6 +141,7 @@ struct tftpd_ctx {
 	int timer_fd;
 	int signal_fd;
 	struct tftpd_client *clients;
+	struct tftpd_file *files;
 	char buf[TFTP_BUFSZ];
 	char cbuf[TFTP_BUFSZ];
 	size_t buf_len;
@@ -299,21 +315,21 @@ err_socket:
 ssize_t tftpd_read_data_block(struct tftpd_ctx *ctx, struct tftpd_client *client)
 {
 	struct tftp_data *reply = (struct tftp_data *)client->buf;
+	size_t offset = 0, chunk_len = 0;
 	if (client->pending) {
 		return 0;
 	}
-	bzero(reply, sizeof(*reply));
 	reply->opcode = htons(OP_DATA);
 	reply->block = htons(client->block_num);
-	client->reply_len = sizeof(*reply);
-
-	if (client->block_num >= MAX_BLOCK_STUB) {
+	offset = (client->block_num - 1)*client->block_size;
+	if (offset + client->block_size > client->file->size) {
 		client->state = S_WAIT_FINAL_ACK;
+		chunk_len = client->file->size - offset;
+	} else {
+		chunk_len = client->block_size;
 	}
-	if (client->state != S_WAIT_FINAL_ACK) {
-		bzero(reply->data, client->block_size);
-		client->reply_len += client->block_size;
-	}
+	memcpy(reply->data, client->file->cache + offset, chunk_len);
+	client->reply_len = sizeof(*reply) + chunk_len;
 	return client->reply_len;
 }
 
@@ -483,6 +499,7 @@ ssize_t tftpd_new_connection(struct tftpd_ctx *ctx) {
 		has_options = 1;
 		// fprintf(stderr, "%s: DBG: block size %d\n", __func__, blksize);
 	}
+	struct tftpd_file *file = find_tftpd_file(ctx->files, filename);
 	struct tftpd_client *client;
 	for (client = ctx->clients; client; client = client->next) {
 		if (!memcmp(&client->client_addr, &ctx->curr_client, sizeof(ctx->curr_client))) {
@@ -495,6 +512,21 @@ ssize_t tftpd_new_connection(struct tftpd_ctx *ctx) {
 			return -1;
 		}
 	}
+	if (!file) {
+		fprintf(stderr, "%s: no such file: %s (requested by %s)\n",
+				__func__, filename, client->str_addr);
+		tftpd_send_error(ctx, client, ENOENT, filename);
+		tftpd_close_connection(ctx, client);
+		return 0;
+	}
+	file->refcnt++;
+	if (client->file != file) {
+		if (client->file) {
+			client->file->refcnt--;
+		}
+		client->file = file;
+	}
+
 	if (client->buf_len < blksize + sizeof(struct tftp_data)) {
 		blksize = client->buf_len - sizeof(struct tftp_data);
 		fprintf(stderr, "%s: DBG: requested block size too big, using %d instead\n",
@@ -523,6 +555,18 @@ void tftpd_close_connection(struct tftpd_ctx *ctx, struct tftpd_client *client)
 	}
 	list_remove(&ctx->clients, client);
 	list_append(&ctx->dead_clients, client);
+	if (client->file) {
+		if (client->file->refcnt) {
+			client->file->refcnt--;
+		}
+		if (!client->file->refcnt) {
+			/* FIXME:
+			 * - implement file opening during the run time
+			 * - add an expiration algorithm
+			 */
+		}
+	}
+	client->file = NULL;
 	if (!ctx->clients) {
 		struct itimerspec its;
 		bzero(&its, sizeof(its));
@@ -790,6 +834,10 @@ int tftpd_start(struct tftpd_ctx *ctx) {
 	struct epoll_event ev;
 	struct sockaddr_in server_addr;
 	sigset_t sigmask;
+	if (populate_file_cache(ctx->files) < 0) {
+		fprintf(stderr, "%s: failed to read in data\n", __func__);
+		return -1;
+	}
 
 	ctx->timer_fd = -1;
 	ctx->epoll_fd = -1;
@@ -886,6 +934,143 @@ out:
 	return -1;
 }
 
+ssize_t cache_tftpd_file(struct tftpd_file *tf) {
+	struct stat stbuf;
+	size_t bytes_remaining = 0;
+	ssize_t bytes_read = 0;
+	char *buf = NULL;
+	bzero(&stbuf, sizeof(stbuf));
+	if (tf->fd <= 0) {
+		tf->fd = open(tf->filename, O_RDONLY);
+	}
+	if (tf->fd < 0) {
+		fprintf(stderr, "%s: failed to open %s: %s\n",
+				__func__,
+				tf->filename,
+				strerror(errno));
+		goto out;
+	}
+	if (fstat(tf->fd, &stbuf) < 0) {
+		fprintf(stderr, "%s: failed to stat %s: %s\n",
+				__func__,
+				tf->filename,
+				strerror(errno));
+		goto out;
+	}
+	if (!(tf->cache = calloc(1, stbuf.st_size))) {
+		fprintf(stderr, "%s: failed to alloc %ld bytes\n",
+				__func__,
+				tf->size);
+		goto out;
+	}
+	if (mlock(tf->cache, stbuf.st_size) < 0) {
+		fprintf(stderr, "%s: failed to lock %ld bytes\n",
+				__func__,
+				tf->size);
+	}
+	tf->size = stbuf.st_size;
+	bytes_remaining = tf->size;
+	buf = tf->cache;
+	while (bytes_remaining > 0) {
+		bytes_read = read(tf->fd, buf, bytes_remaining);
+		if (bytes_read < 0) {
+			fprintf(stderr, "%s: failed to read %ld bytes from %s\n",
+					__func__,
+					bytes_remaining,
+					tf->filename);
+			goto out;
+		}
+		bytes_remaining -= bytes_read;
+		buf += bytes_read;
+	}
+	fprintf(stderr, "%s: cached file %s (%ld bytes)\n",
+			__func__, tf->filename, tf->size);
+	return tf->size;
+out:
+	close_tftpd_file(tf);
+	return -1;
+}
+
+void close_tftpd_file(struct tftpd_file *tf) {
+	if (tf->size > 0) {
+		munlock(tf->cache, tf->size);
+		tf->size = 0;
+	}
+	if (tf->cache) {
+		free(tf->cache);
+		tf->cache = NULL;
+	}
+	if (tf->fd >= 0) {
+		close(tf->fd);
+		tf->fd = -1;
+	}
+}
+
+int populate_file_cache(struct tftpd_file *head)
+{
+	int nfiles = 0;
+	for (struct tftpd_file *tf = head; tf; tf = tf->next) {
+		if (!tf->filename) {
+			fprintf(stderr, "%s: ERR: nameless file\n", __func__);
+			goto out;
+		}
+		if (cache_tftpd_file(tf) < 0) {
+			fprintf(stderr, "%s: ERR: failed to cache file %s\n",
+					__func__, tf->filename);
+			goto out;
+		}
+		++nfiles;
+	}
+	return nfiles;
+out:
+	for (struct tftpd_file *tf = head; tf; tf = tf->next) {
+		close_tftpd_file(tf);
+	}
+	return -1;
+}
+
+struct tftpd_file *find_tftpd_file(struct tftpd_file *head, const char *filename)
+{
+	for (struct tftpd_file *f = head; f; f = f->next) {
+		if (!strcmp(filename, f->filename)) {
+			return f;
+		}
+	}
+	return NULL;
+}
+
+struct tftpd_file *add_tftpd_file(struct tftpd_file **headp, const char *filename) {
+	if (!headp) {
+		return NULL;
+	}
+	struct tftpd_file *f = find_tftpd_file(*headp, filename);
+	if (f) {
+		return f;
+	}
+	f = calloc(1, sizeof(struct tftpd_file));
+	if (!f) {
+		fprintf(stderr, "%s: buy more RAM\n", __func__);
+		return NULL;
+	}
+	f->filename = strdup(filename);
+	if (!f->filename) {
+		fprintf(stderr, "%s: buy more RAM\n", __func__);
+		goto out;
+	}
+	list_append(headp, f);
+	return f;
+out:
+	if (f && f->filename) {
+		free(f->filename);
+		f->filename = NULL;
+	}
+	if (f) {
+		free(f);
+		f = NULL;
+	}
+	return NULL;
+}
+
 int main(int argc, char **argv) {
 	struct tftpd_ctx ctx;
 	bzero(&ctx, sizeof(ctx));
@@ -894,6 +1079,12 @@ int main(int argc, char **argv) {
 	ctx.conf.client_timeout = 5;
 	ctx.buf_len = TFTP_BUFSZ;
 	ctx.cbuf_len = TFTP_BUFSZ;
+	for (int i = 1; i < argc; ++i) {
+		if (!add_tftpd_file(&ctx.files, argv[i])) {
+			fprintf(stderr, "%s: failed to add file: %s\n", __func__, argv[i]);
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	if (tftpd_start(&ctx) < 0) {
 		exit(EXIT_FAILURE);
