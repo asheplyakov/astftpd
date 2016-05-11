@@ -71,7 +71,8 @@ enum {
 };
 
 enum {
-	TFTP_BUFSZ = 2048,
+	TFTP_BUFSZ = 1024,
+	TFTP_CLIENT_BUFSZ = 128,
 };
 
 enum {
@@ -106,6 +107,8 @@ struct tftpd_client {
 	int sock;
 	int fd;
 	struct tftpd_file *file; // owned by tftpd_ctx
+	char *data; // points into file->cache and is owned by file
+	size_t data_len;
 	uint16_t block_num;
 	uint16_t block_size;
 	uint16_t tftp_tid; // local port number, in network byte order
@@ -113,7 +116,7 @@ struct tftpd_client {
 	int state;
 	int has_options;
 	struct sockaddr_storage client_addr;
-	char buf[TFTP_BUFSZ];
+	char buf[TFTP_CLIENT_BUFSZ];
 	size_t buf_len;
 	size_t reply_len;
 	char str_addr[INET_ADDRSTRLEN + sizeof("12345")];
@@ -244,7 +247,7 @@ struct tftpd_client *tftpd_new_client(struct tftpd_ctx *ctx)
 	}
 	client->block_size = BLKSIZE_DFLT;
 	client->block_num = 1;
-	client->buf_len = TFTP_BUFSZ;
+	client->buf_len = TFTP_CLIENT_BUFSZ;
 	memcpy(&client->client_addr, &ctx->curr_client, sizeof(client->client_addr));
 	if (sprintf_addr(client->str_addr, sizeof(client->str_addr), &ctx->curr_client) < 0) {
 		bzero(client->str_addr, sizeof(client->str_addr));
@@ -328,9 +331,10 @@ ssize_t tftpd_read_data_block(struct tftpd_ctx *ctx, struct tftpd_client *client
 	} else {
 		chunk_len = client->block_size;
 	}
-	memcpy(reply->data, client->file->cache + offset, chunk_len);
-	client->reply_len = sizeof(*reply) + chunk_len;
-	return client->reply_len;
+	client->data = client->file->cache + offset;
+	client->data_len = chunk_len;
+	client->reply_len = sizeof(*reply);
+	return client->reply_len + chunk_len;
 }
 
 int subscribe_sock_is_writable(struct tftpd_ctx *ctx, struct tftpd_client *client, int val)
@@ -358,7 +362,13 @@ ssize_t tftpd_send_reply_pkt(struct tftpd_ctx *ctx, struct tftpd_client *client)
 	iov[0].iov_base = client->buf;
 	iov[0].iov_len = client->reply_len;
 	msg.msg_iov = iov;
+	if (client->data_len) {
+		iov[1].iov_base = client->data;
+		iov[1].iov_len = client->data_len;
+		msg.msg_iovlen = 2;
+	} else {
 		msg.msg_iovlen = 1;
+	}
 	bytes_sent = sendmsg(client->sock, &msg, 0);
 	if (likely(bytes_sent > 0)) {
 		if (unlikely(client->pending)) {
@@ -527,11 +537,6 @@ ssize_t tftpd_new_connection(struct tftpd_ctx *ctx) {
 		client->file = file;
 	}
 
-	if (client->buf_len < blksize + sizeof(struct tftp_data)) {
-		blksize = client->buf_len - sizeof(struct tftp_data);
-		fprintf(stderr, "%s: DBG: requested block size too big, using %d instead\n",
-				__func__, blksize);
-	}
 	client->block_size = blksize;
 	if (has_options) {
 		client->block_num = 0;
