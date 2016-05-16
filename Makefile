@@ -1,7 +1,7 @@
 
 CC ?= gcc
-CFLAGS ?= -std=c99 -Wall -g -O2 -pipe
-LDFLAGS ?=
+CFLAGS ?= -std=c99 -Wall -g -O2 -pipe -pthread
+LDFLAGS ?= -pthread
 DEPDIR ?= .d
 
 SRC := astftpd.c

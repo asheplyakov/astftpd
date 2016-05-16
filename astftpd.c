@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -87,7 +88,12 @@ enum tftp_client_state {
 	S_TIMEOUT        = 5,
 };
 
-/* stores the whole file cached in the RAM */
+/*
+ * stores the whole file cached in the RAM
+ * The data gets read in before starting server threads, after that both
+ * the list and its entries are immutable (hence no locks).
+ * TODO: use a lock free list instead
+ */
 struct tftpd_file {
 	char *filename;
 	char *cache;
@@ -103,10 +109,11 @@ int populate_file_cache(struct tftpd_file *head);
 struct tftpd_file *find_tftpd_file(struct tftpd_file *head, const char *filename);
 struct tftpd_file *add_tftpd_file(struct tftpd_file **headp, const char *filename);
 
+/* No locks - each thread maintains its own clients list */
 struct tftpd_client {
 	int sock;
 	int fd;
-	struct tftpd_file *file; // owned by tftpd_ctx
+	struct tftpd_file *file; // owned by the main thread
 	char *data; // points into file->cache and is owned by file
 	size_t data_len;
 	uint16_t block_num;
@@ -529,7 +536,7 @@ ssize_t tftpd_new_connection(struct tftpd_ctx *ctx) {
 		tftpd_close_connection(ctx, client);
 		return 0;
 	}
-	file->refcnt++;
+	__sync_add_and_fetch(&file->refcnt, 1);
 	if (client->file != file) {
 		if (client->file) {
 			client->file->refcnt--;
@@ -560,16 +567,12 @@ void tftpd_close_connection(struct tftpd_ctx *ctx, struct tftpd_client *client)
 	}
 	list_remove(&ctx->clients, client);
 	list_append(&ctx->dead_clients, client);
-	if (client->file) {
-		if (client->file->refcnt) {
-			client->file->refcnt--;
-		}
-		if (!client->file->refcnt) {
-			/* FIXME:
-			 * - implement file opening during the run time
-			 * - add an expiration algorithm
-			 */
-		}
+	if (client->file && __sync_sub_and_fetch(&client->file->refcnt, 1) == 0) {
+		/*
+		 * TODO: make the file list non-blocking
+		 * TODO: implement reading in files in a dedicated thread
+		 * TODO: implement the control socket and commands controlling the cache
+		 */
 	}
 	client->file = NULL;
 	if (!ctx->clients) {
@@ -839,10 +842,6 @@ int tftpd_start(struct tftpd_ctx *ctx) {
 	struct epoll_event ev;
 	struct sockaddr_in server_addr;
 	sigset_t sigmask;
-	if (populate_file_cache(ctx->files) < 0) {
-		fprintf(stderr, "%s: failed to read in data\n", __func__);
-		return -1;
-	}
 
 	ctx->timer_fd = -1;
 	ctx->epoll_fd = -1;
@@ -879,6 +878,20 @@ int tftpd_start(struct tftpd_ctx *ctx) {
 
 	if ((ctx->sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0)) < 0) {
 		perror("socket");
+		goto out;
+	}
+
+	if (setsockopt(ctx->sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+		perror("setsockopt SO_REUSEADDR");
+		goto out;
+	}
+	/* Allow more than one process/thread to bind to the address:port.
+	 * The kernel will distribute incoming datagrams between the server threads.
+	 * Therefore all threads are equal (no special thread accepting the connections)
+	 * and clients list and all that are per thread and don't need any locks
+	 */
+	if (setsockopt(ctx->sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0) {
+		perror("setsockopt SO_REUSEPORT");
 		goto out;
 	}
 
@@ -1076,7 +1089,8 @@ out:
 	return NULL;
 }
 
-int main(int argc, char **argv) {
+void *tftpd_thread(void *arg)
+{
 	struct tftpd_ctx ctx;
 	bzero(&ctx, sizeof(ctx));
 	ctx.conf.port = TFTP_PORT;
@@ -1084,18 +1098,42 @@ int main(int argc, char **argv) {
 	ctx.conf.client_timeout = 5;
 	ctx.buf_len = TFTP_BUFSZ;
 	ctx.cbuf_len = TFTP_BUFSZ;
+	ctx.files = (struct tftpd_file *)arg;
+	if (tftpd_start(&ctx) < 0) {
+		return NULL;
+	}
+	if (tftpd_run(&ctx) < 0) {
+		return NULL;
+	}
+	return NULL;
+}
+
+int main(int argc, char **argv) {
+	struct tftpd_file *cached_files = NULL;
+	int cpu_count = 1, max_threads = 1;
 	for (int i = 1; i < argc; ++i) {
-		if (!add_tftpd_file(&ctx.files, argv[i])) {
+		if (!add_tftpd_file(&cached_files, argv[i])) {
 			fprintf(stderr, "%s: failed to add file: %s\n", __func__, argv[i]);
 			exit(EXIT_FAILURE);
 		}
 	}
-
-	if (tftpd_start(&ctx) < 0) {
+	if (populate_file_cache(cached_files) < 0) {
+		fprintf(stderr, "%s: failed to cache files\n", __func__);
 		exit(EXIT_FAILURE);
 	}
-	if (tftpd_run(&ctx) < 0) {
-		exit(EXIT_FAILURE);
+	if ((cpu_count = sysconf(_SC_NPROCESSORS_ONLN)) <= 0) {
+		cpu_count = 1;
+	}
+	max_threads = cpu_count;
+	pthread_t tids[max_threads];
+
+	for (int i = 0; i < max_threads; ++i) {
+		if (pthread_create(&tids[i], NULL, tftpd_thread, cached_files) != 0) {
+			exit(EXIT_FAILURE);
+		}
+	}
+	for (int i = 0; i < max_threads; ++i) {
+		pthread_join(tids[i], NULL);
 	}
 	exit(EXIT_SUCCESS);
 }
