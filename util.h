@@ -49,6 +49,12 @@
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 
+#define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:-!!(e)*1234; }))
+#define SAME_TYPES(t1, t2) (__builtin_types_compatible_p(__typeof__(t1), __typeof__(t2)))
+#define MUST_BE_ARRAY(a) BUILD_BUG_ON_ZERO(SAME_TYPES((a), &(a)[0]))
+#define ARRAY_SIZE(arr) ((sizeof(arr)/sizeof(arr[0])) + MUST_BE_ARRAY(arr))
+
+
 static inline uint64_t pack_fd_as_ptr(int fd) {
 	uint64_t asptr = (uint64_t)fd;
 	return (asptr << 1) | 1U;
