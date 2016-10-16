@@ -954,9 +954,6 @@ out:
 
 ssize_t cache_tftpd_file(struct tftpd_file *tf) {
 	struct stat stbuf;
-	size_t bytes_remaining = 0;
-	ssize_t bytes_read = 0;
-	char *buf = NULL;
 	bzero(&stbuf, sizeof(stbuf));
 	if (tf->fd <= 0) {
 		tf->fd = open(tf->filename, O_RDONLY);
@@ -975,10 +972,12 @@ ssize_t cache_tftpd_file(struct tftpd_file *tf) {
 				strerror(errno));
 		goto out;
 	}
-	if (!(tf->cache = calloc(1, stbuf.st_size))) {
-		fprintf(stderr, "%s: failed to alloc %ld bytes\n",
+	if (!(tf->cache = mmap(NULL, stbuf.st_size, PROT_READ, MAP_SHARED, tf->fd, 0))) {
+		fprintf(stderr, "%s: failed to mmap %s: %s (%d)\n",
 				__func__,
-				tf->size);
+				tf->filename,
+				strerror(errno),
+				errno);
 		goto out;
 	}
 	if (mlock(tf->cache, stbuf.st_size) < 0) {
@@ -987,22 +986,24 @@ ssize_t cache_tftpd_file(struct tftpd_file *tf) {
 				tf->size);
 	}
 	tf->size = stbuf.st_size;
-	bytes_remaining = tf->size;
-	buf = tf->cache;
-	while (bytes_remaining > 0) {
-		bytes_read = read(tf->fd, buf, bytes_remaining);
-		if (bytes_read < 0) {
-			fprintf(stderr, "%s: failed to read %ld bytes from %s\n",
-					__func__,
-					bytes_remaining,
-					tf->filename);
-			goto out;
-		}
-		bytes_remaining -= bytes_read;
-		buf += bytes_read;
+	if (readahead(tf->fd, 0, tf->size) < 0) {
+		fprintf(stderr, "%s: failed to readahead file %s: %s (%d)\n",
+				__func__,
+				tf->filename,
+				strerror(errno),
+				errno);
 	}
 	fprintf(stderr, "%s: cached file %s (%ld bytes)\n",
 			__func__, tf->filename, tf->size);
+	if (close(tf->fd) < 0) {
+		fprintf(stderr, "%s: failed to close file %s (fd %d): %s (%d)\n",
+				__func__,
+				tf->filename,
+				tf->fd,
+				strerror(errno),
+				errno);
+	}
+	tf->fd = -1;
 	return tf->size;
 out:
 	close_tftpd_file(tf);
@@ -1010,13 +1011,17 @@ out:
 }
 
 void close_tftpd_file(struct tftpd_file *tf) {
-	if (tf->size > 0) {
+	if (tf->cache && tf->size > 0) {
 		munlock(tf->cache, tf->size);
-		tf->size = 0;
-	}
-	if (tf->cache) {
-		free(tf->cache);
+		if (munmap(tf->cache, tf->size) < 0) {
+			fprintf(stderr, "%s: failed to unmap %s: %s (%d), continue anyway\n",
+					__func__,
+					tf->filename,
+					strerror(errno),
+					errno);
+		}
 		tf->cache = NULL;
+		tf->size = 0;
 	}
 	if (tf->fd >= 0) {
 		close(tf->fd);
