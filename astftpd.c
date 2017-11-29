@@ -983,7 +983,7 @@ ssize_t cache_tftpd_file(struct tftpd_file *tf) {
 	if (mlock(tf->cache, stbuf.st_size) < 0) {
 		fprintf(stderr, "%s: failed to lock %ld bytes\n",
 				__func__,
-				tf->size);
+				(long)stbuf.st_size);
 	}
 	tf->size = stbuf.st_size;
 	if (readahead(tf->fd, 0, tf->size) < 0) {
