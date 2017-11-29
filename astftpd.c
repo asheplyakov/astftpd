@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <sched.h> // CPU_SET
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -1113,6 +1114,27 @@ void *tftpd_thread(void *arg)
 	return NULL;
 }
 
+/* Ask the kernel to pin nth thread to nth CPU */
+static void set_affinities(pthread_attr_t *attrs, int max_threads) {
+	int rc;
+	for (int i = 0; i < max_threads; i++) {
+		cpu_set_t affinity; /* has nothing to do with Linux' cpusets */
+		CPU_ZERO(&affinity);
+		CPU_SET(i, &affinity);
+		if ((rc = pthread_attr_init(&attrs[i])) != 0) {
+			fprintf(stderr, "pthread_attr_init failed: %d (%s)\n",
+				rc, strerror(rc));
+			exit(1);
+		}
+		if ((rc = pthread_attr_setaffinity_np(&attrs[i], sizeof(affinity), &affinity)) != 0) {
+			fprintf(stderr, "pthread_attr_setaffinity_np failed: %d (%s)\n",
+				rc, strerror(rc));
+			exit(1);
+		}
+	}
+}
+
+
 int main(int argc, char **argv) {
 	struct tftpd_file *cached_files = NULL;
 	int cpu_count = 1, max_threads = 1;
@@ -1131,9 +1153,11 @@ int main(int argc, char **argv) {
 	}
 	max_threads = cpu_count;
 	pthread_t tids[max_threads];
+	pthread_attr_t tattrs[max_threads];
+	set_affinities(tattrs, max_threads);
 
 	for (int i = 0; i < max_threads; ++i) {
-		if (pthread_create(&tids[i], NULL, tftpd_thread, cached_files) != 0) {
+		if (pthread_create(&tids[i], &tattrs[i], tftpd_thread, cached_files) != 0) {
 			exit(EXIT_FAILURE);
 		}
 	}
