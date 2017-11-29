@@ -362,7 +362,7 @@ int subscribe_sock_is_writable(struct tftpd_ctx *ctx, struct tftpd_client *clien
 
 ssize_t tftpd_send_reply_pkt(struct tftpd_ctx *ctx, struct tftpd_client *client)
 {
-	size_t bytes_sent = 0;
+	ssize_t bytes_sent = 0;
 	struct msghdr msg;
 	struct iovec iov[2];
 	bzero(&msg, sizeof(msg));
