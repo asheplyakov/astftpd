@@ -588,7 +588,7 @@ int tftpd_handle_ack(struct tftpd_ctx *ctx, struct tftpd_client *client)
 {
 	struct tftp_ack *reply = (struct tftp_ack *)ctx->buf;
 	uint16_t block_num = ntohs(reply->block);
-	if (block_num != client->block_num) {
+	if (block_num < client->block_num - 1 || block_num > client->block_num) {
 		fprintf(stderr, "%s: WARN: bogus ACK, expected block %d, got %d\n",
 				__func__,
 				(int)client->block_num,
