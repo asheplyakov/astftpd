@@ -3,6 +3,7 @@ CC ?= gcc
 CFLAGS ?= -std=c99 -Wall -g -O2 -pipe -pthread
 LDFLAGS ?= -pthread
 DEPDIR ?= .d
+SHELL := /bin/bash
 
 SRC := astftpd.c
 OBJ := $(SRC:%.c=%.o)
@@ -31,6 +32,9 @@ clean:
 	-rm -f $(OBJ)
 	-rm -f $(asclient_OBJ)
 	-rm -f $(DEPDIR)/*.Td $(DEPDIR)/*.d
+
+fixcaps: astftpd
+	echo -e 'cap_net_bind_service=+ep\ncap_ipc_lock=+ep\n' | sudo setcap -q - $<
 
 $(DEPDIR)/%.d: ;
 .PRECIOUS: $(DEPDIR)/%.d
